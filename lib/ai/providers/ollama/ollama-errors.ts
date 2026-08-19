@@ -1,0 +1,189 @@
+import {
+  AIProviderError,
+  type AIProviderErrorCode,
+} from "@/lib/ai/types";
+import { logAIProviderErrorThrown } from "@/lib/ai/ai-provider-error-logging";
+
+interface OllamaErrorLike {
+  status?: number;
+  code?: string;
+  name?: string;
+  message?: string;
+  cause?: unknown;
+}
+
+export interface OllamaProviderErrorContext {
+  provider?: string;
+  model?: string;
+  statusCode?: number;
+  metadata?: Record<string, unknown>;
+}
+
+function extractMessage(error: OllamaErrorLike, fallback: string) {
+  if (typeof error.message === "string" && error.message.trim()) {
+    return error.message;
+  }
+  return fallback;
+}
+
+function includesAny(value: string, patterns: string[]) {
+  return patterns.some((pattern) => value.includes(pattern));
+}
+
+function getErrorCode(
+  error: OllamaErrorLike,
+  context: OllamaProviderErrorContext,
+): AIProviderErrorCode {
+  const rawMessage = String(error.message ?? "").toLowerCase();
+  const metadataReason = String(context.metadata?.reason ?? "").toLowerCase();
+
+  if (
+    includesAny(rawMessage, [
+      "not found, try pulling it first",
+      "model not found",
+      "pull it first",
+    ])
+  ) {
+    return "model_not_found";
+  }
+
+  if (error.name === "AbortError") return "cancelled";
+  if (error.status === 400) return "invalid_request";
+  if (error.status === 401) return "authentication";
+  if (error.status === 403) return "authorization";
+  if (error.status === 404) {
+    return metadataReason === "http-error" ? "unavailable" : "model_not_found";
+  }
+  if (error.status === 408) return "timeout";
+  if (error.status === 429) return "rate_limit";
+  if (error.status !== undefined && error.status >= 500) return "unavailable";
+
+  if (
+    includesAny(rawMessage, [
+      "econnrefused",
+      "fetch failed",
+      "failed to fetch",
+      "enotfound",
+      "eai_again",
+      "connect",
+      "connection refused",
+      "networkerror",
+    ])
+  ) {
+    return "unavailable";
+  }
+
+  if (
+    includesAny(rawMessage, [
+      "socket hang up",
+      "other side closed",
+      "connection closed",
+      "terminated",
+    ])
+  ) {
+    return "provider_error";
+  }
+
+  if (
+    metadataReason === "connect-timeout" ||
+    metadataReason === "request-timeout" ||
+    metadataReason === "body-missing" ||
+    metadataReason === "invalid-json" ||
+    metadataReason === "unexpected-format" ||
+    metadataReason === "unexpected-content-type" ||
+    metadataReason === "stream-without-finish" ||
+    metadataReason === "post-finish-data" ||
+    metadataReason === "provider-stream-error" ||
+    metadataReason === "http-error"
+  ) {
+    return metadataReason === "connect-timeout" || metadataReason === "request-timeout"
+      ? "timeout"
+      : "provider_error";
+  }
+
+  return "unknown";
+}
+
+function isRetryable(code: AIProviderErrorCode) {
+  return (
+    code === "timeout" ||
+    code === "unavailable" ||
+    code === "provider_error"
+  );
+}
+
+export function toOllamaProviderError(
+  error: unknown,
+  context: OllamaProviderErrorContext = {},
+): AIProviderError {
+  if (error instanceof AIProviderError) {
+    logAIProviderErrorThrown({
+      sourceFile: "lib/ai/providers/ollama/ollama-errors.ts",
+      sourceLine: 118,
+      reason: "ollama_error_passthrough",
+      requestId:
+        typeof error.metadata?.requestId === "string"
+          ? error.metadata.requestId
+          : undefined,
+    });
+    return error;
+  }
+
+  const candidate = (error ?? {}) as OllamaErrorLike;
+  const code = getErrorCode(candidate, context);
+  const message =
+    code === "authentication"
+      ? "A autenticacao com o Ollama falhou."
+      : code === "authorization"
+        ? "O Ollama recusou a operacao solicitada."
+        : code === "invalid_request"
+          ? extractMessage(candidate, "O pedido enviado ao Ollama e invalido.")
+          : code === "model_not_found"
+            ? "O modelo solicitado nao esta instalado no Ollama."
+            : code === "timeout"
+              ? "O Ollama demorou mais que o permitido."
+              : code === "cancelled"
+                ? "A operacao com o Ollama foi cancelada."
+                : code === "unavailable"
+                  ? "O servidor Ollama esta indisponivel no momento."
+                  : code === "rate_limit"
+                    ? "O Ollama recusou temporariamente novas requisicoes."
+                  : context.metadata?.reason === "body-missing"
+                    ? "O Ollama respondeu sem body para esta operacao."
+                    : context.metadata?.reason === "invalid-json"
+                      ? "O Ollama retornou JSON invalido no streaming."
+                      : context.metadata?.reason === "unexpected-content-type"
+                        ? "O Ollama retornou um content-type inesperado."
+                        : context.metadata?.reason === "stream-without-finish"
+                          ? "O stream do Ollama terminou sem conclusao valida."
+                          : context.metadata?.reason === "post-finish-data"
+                            ? "O Ollama retornou dados extras apos a conclusao do stream."
+                          : context.metadata?.reason === "provider-stream-error"
+                            ? "O Ollama retornou um erro no stream."
+                        : context.metadata?.reason === "unexpected-format"
+                          ? "O Ollama retornou um formato inesperado."
+                        : extractMessage(
+                            candidate,
+                            "O Ollama retornou um erro inesperado.",
+                          );
+
+  logAIProviderErrorThrown({
+    sourceFile: "lib/ai/providers/ollama/ollama-errors.ts",
+    sourceLine: 160,
+    reason: `ollama_error_normalized:${code}:${String(context.metadata?.reason ?? "generic")}`,
+    requestId:
+      typeof context.metadata?.requestId === "string"
+        ? context.metadata.requestId
+        : undefined,
+  });
+  return new AIProviderError({
+    code,
+    message,
+    provider: context.provider,
+    model: context.model,
+    retryable: isRetryable(code),
+    cause: error,
+    statusCode: context.statusCode ?? candidate.status,
+    metadata: context.metadata,
+  });
+}

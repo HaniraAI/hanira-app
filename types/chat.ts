@@ -14,6 +14,7 @@ export interface ChatMessage {
 export interface Conversation {
   id: string;
   title: string;
+  projectId?: string;
   updatedAt: string;
   archivedAt?: string | null;
   messages: ChatMessage[];
@@ -26,13 +27,14 @@ export interface ConversationListResponse {
 
 export interface ChatRequest {
   conversationId?: string;
+  projectId?: string;
   message: string;
   requestId?: string;
   retry?: boolean;
   attachmentIds?: string[];
   demoAttachments?: Array<{
     id: string;
-    type: "image" | "audio";
+    type: "image" | "audio" | "document";
     originalName: string;
     mimeType: string;
     sizeBytes: number;

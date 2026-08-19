@@ -7,6 +7,11 @@ export type ResponseStyle =
 
 export interface UserSettings {
   preferredName: string | null;
+  occupation: string | null;
+  language: string;
+  technicalLevel: "beginner" | "intermediate" | "advanced";
+  responseLength: "short" | "balanced" | "detailed";
+  responseTone: "professional" | "neutral" | "casual";
   responseStyle: ResponseStyle;
   memoryEnabled: boolean;
   voiceEnabled: boolean;
@@ -25,4 +30,8 @@ export interface Memory {
   category: string | null;
   importance: number;
   createdAt: string;
+  scope?: "global" | "project";
+  projectId?: string | null;
+  updatedAt?: string;
+  origin?: string;
 }

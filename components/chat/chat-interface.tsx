@@ -46,6 +46,7 @@ export function ChatInterface({ userName }: { userName: string }) {
   const store = useChatStore();
   const conversation = store.activeConversation();
   const messagesEnd = useRef<HTMLDivElement>(null);
+  const shouldFollowStream = useRef(true);
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_USER_SETTINGS);
   const [voiceModeOpen, setVoiceModeOpen] = useState(false);
   const [privacyOpen, setPrivacyOpen] = useState(false);
@@ -67,7 +68,7 @@ export function ChatInterface({ userName }: { userName: string }) {
   }, []);
 
   useEffect(() => {
-    messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
+    if (shouldFollowStream.current) messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [conversation?.messages.length, store.isThinking]);
 
   const lastMessage = conversation?.messages.at(-1);
@@ -126,7 +127,13 @@ export function ChatInterface({ userName }: { userName: string }) {
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">
-          <div className="flex-1 overflow-y-auto">
+          <div
+            className="flex-1 overflow-y-auto"
+            onScroll={(event) => {
+              const element = event.currentTarget;
+              shouldFollowStream.current = element.scrollHeight - element.scrollTop - element.clientHeight < 96;
+            }}
+          >
             {store.status === "loading" && !conversation ? (
               <div className="grid h-full place-items-center text-sm text-zinc-600">
                 <div className="flex flex-col items-center gap-4">
@@ -175,7 +182,10 @@ export function ChatInterface({ userName }: { userName: string }) {
                               ? "A resposta foi interrompida."
                               : "")}
                           {message.pending && message.content && (
-                            <span className="ml-1 inline-block h-4 w-0.5 animate-pulse bg-violet-300 align-middle" />
+                            <>
+                              <span className="ml-1 inline-block h-4 w-0.5 animate-pulse bg-violet-300 align-middle" />
+                              <span className="ml-2 text-xs text-zinc-600">Gerando resposta...</span>
+                            </>
                           )}
                         </div>
                         {message.role === "assistant" &&
@@ -236,7 +246,7 @@ export function ChatInterface({ userName }: { userName: string }) {
                     <HaniraMark compact />
                     <div className="flex items-center gap-2 text-sm text-zinc-500">
                       <Sparkles className="size-3.5 animate-pulse text-violet-400" />
-                      <span className="shimmer">Hanira está pensando...</span>
+                      <span className="shimmer">Preparando o motor local...</span>
                     </div>
                   </div>
                 )}

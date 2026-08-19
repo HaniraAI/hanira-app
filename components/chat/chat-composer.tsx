@@ -13,9 +13,11 @@ import {
   ArrowUp,
   Camera,
   FileAudio,
+  FileText,
   ImagePlus,
   LoaderCircle,
   Mic,
+  Paperclip,
   Square,
   X,
 } from "lucide-react";
@@ -23,23 +25,40 @@ import { PrivacyDialog } from "@/components/media/privacy-dialog";
 import { VoiceRecorder } from "@/components/voice/voice-recorder";
 import { useAutoResize } from "@/hooks/use-auto-resize";
 import {
+  CHAT_MESSAGE_LENGTH_ERROR,
+  CHAT_MESSAGE_MAX_LENGTH,
+  getChatMessageLength,
+  getRemainingChatMessageCharacters,
+  isChatMessageTooLong,
+  willExceedChatMessageLimit,
+} from "@/lib/chat/message-limits";
+import {
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  MAX_DOCUMENTS_PER_MESSAGE,
   MAX_IMAGES_PER_MESSAGE,
   mediaConfig,
 } from "@/lib/media/config";
 import { useChatStore } from "@/lib/stores/chat-store";
-import { validateMediaFile } from "@/lib/validation/media";
+import {
+  inferAttachmentTypeFromMimeType,
+  validateMediaFile,
+} from "@/lib/validation/media";
 import { streamChatMessage } from "@/services/chat-service";
 import { uploadMediaFiles } from "@/services/media-service";
 import type { ChatMessage } from "@/types/chat";
-import type { Attachment } from "@/types/media";
+import type { Attachment, AttachmentType } from "@/types/media";
 import type { UserSettings } from "@/types/settings";
 
 interface PendingMedia {
   id: string;
   file: File;
-  type: "image" | "audio";
+  type: AttachmentType;
   previewUrl: string;
   attachment?: Attachment;
+}
+
+function previewUrlForFile(file: File, type: AttachmentType) {
+  return type === "image" || type === "audio" ? URL.createObjectURL(file) : "";
 }
 
 export function ChatComposer({ settings }: { settings: UserSettings }) {
@@ -47,52 +66,84 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
   const [pendingMedia, setPendingMedia] = useState<PendingMedia[]>([]);
   const [uploading, setUploading] = useState(false);
   const [recorderOpen, setRecorderOpen] = useState(false);
-  const [privacyKind, setPrivacyKind] = useState<
-    "camera" | "microphone" | null
-  >(null);
+  const [privacyKind, setPrivacyKind] = useState<"camera" | "microphone" | null>(
+    null,
+  );
   const abortRef = useRef<AbortController | null>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const cameraInputRef = useRef<HTMLInputElement>(null);
+  const documentInputRef = useRef<HTMLInputElement>(null);
   const { ref, resize } = useAutoResize();
   const store = useChatStore();
+  const messageLength = getChatMessageLength(store.draft);
+  const remainingCharacters = getRemainingChatMessageCharacters(store.draft);
+
+  function showMessageLengthError() {
+    setError(CHAT_MESSAGE_LENGTH_ERROR);
+  }
+
+  function clearMessageLengthError() {
+    setError((current) => (current === CHAT_MESSAGE_LENGTH_ERROR ? "" : current));
+  }
 
   async function ensureConversation() {
     if (!store.activeConversation()) await store.newConversation();
     return useChatStore.getState().activeConversation();
   }
 
-  async function addImages(files: File[]) {
+  async function addFiles(files: File[]) {
     setError("");
-    if (!mediaConfig.visionEnabled) {
-      setError("A visão está desativada na configuração do produto.");
+    if (!mediaConfig.attachmentsEnabled) {
+      setError("Os anexos estao desativados nesta instancia.");
       return;
     }
-    const currentImages = pendingMedia.filter(
-      (item) => item.type === "image",
-    ).length;
-    const available = MAX_IMAGES_PER_MESSAGE - currentImages;
-    if (files.length > available) {
-      setError(`Você pode enviar até ${MAX_IMAGES_PER_MESSAGE} imagens.`);
-      files = files.slice(0, Math.max(0, available));
+
+    const nextImages =
+      pendingMedia.filter((item) => item.type === "image").length +
+      files.filter((file) => file.type.startsWith("image/")).length;
+    const nextDocuments =
+      pendingMedia.filter((item) => item.type === "document").length +
+      files.filter((file) =>
+        ["application/pdf", "text/plain", "text/markdown"].includes(
+          file.type.split(";")[0].toLowerCase(),
+        ),
+      ).length;
+    if (nextImages > MAX_IMAGES_PER_MESSAGE) {
+      setError(`Voce pode enviar ate ${MAX_IMAGES_PER_MESSAGE} imagens.`);
+      return;
     }
+    if (nextDocuments > MAX_DOCUMENTS_PER_MESSAGE) {
+      setError(`Voce pode enviar ate ${MAX_DOCUMENTS_PER_MESSAGE} documentos.`);
+      return;
+    }
+    if (pendingMedia.length + files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+      setError(`Voce pode enviar ate ${MAX_ATTACHMENTS_PER_MESSAGE} anexos.`);
+      return;
+    }
+
     const accepted: PendingMedia[] = [];
     for (const file of files) {
       try {
-        await validateMediaFile(file, "image");
-        if ("createImageBitmap" in window) {
+        const type = inferAttachmentTypeFromMimeType(file.type);
+        if (!type) {
+          throw new Error("Use imagem, audio ou documento suportado.");
+        }
+        if (type === "image" && !mediaConfig.visionEnabled) {
+          throw new Error("A visao esta desativada na configuracao do produto.");
+        }
+        await validateMediaFile(file, type);
+        if (type === "image" && "createImageBitmap" in window) {
           const bitmap = await createImageBitmap(file);
           bitmap.close();
         }
         accepted.push({
           id: crypto.randomUUID(),
           file,
-          type: "image",
-          previewUrl: URL.createObjectURL(file),
+          type,
+          previewUrl: previewUrlForFile(file, type),
         });
       } catch (caught) {
-        setError(
-          caught instanceof Error ? caught.message : "Imagem inválida.",
-        );
+        setError(caught instanceof Error ? caught.message : "Arquivo invalido.");
       }
     }
     setPendingMedia((value) => [...value, ...accepted]);
@@ -103,7 +154,12 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
     retry = false,
     attachmentOverride?: Attachment[],
   ) {
-    const content = (contentOverride ?? store.draft).trim();
+    const rawContent = contentOverride ?? store.draft;
+    if (isChatMessageTooLong(rawContent)) {
+      showMessageLengthError();
+      return;
+    }
+    const content = rawContent.trim();
     const hasMedia = pendingMedia.length > 0 || Boolean(attachmentOverride?.length);
     if ((!content && !hasMedia) || store.isThinking || uploading) return;
     const conversation = await ensureConversation();
@@ -126,11 +182,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
             .filter((item) => !item.attachment)
             .map((item) => item.file);
           const uploaded = filesToUpload.length
-            ? await uploadMediaFiles(
-                conversation.id,
-                filesToUpload,
-                abortController.signal,
-              )
+            ? await uploadMediaFiles(conversation.id, filesToUpload, abortController.signal)
             : [];
           attachments = [...alreadyStored, ...uploaded];
         } else {
@@ -192,10 +244,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
         {
           onStart: (serverConversationId) => {
             if (serverConversationId !== conversation.id) {
-              store.replaceConversationId(
-                conversation.id,
-                serverConversationId,
-              );
+              store.replaceConversationId(conversation.id, serverConversationId);
             }
           },
           onDelta: (delta) => {
@@ -212,6 +261,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
           },
           onError: (message) => {
             setError(message);
+            store.setDraft(content);
             store.markMessageFailed(assistantId);
             window.dispatchEvent(new Event("hanira:response-error"));
           },
@@ -230,10 +280,9 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
         return;
       }
       const message =
-        caught instanceof Error
-          ? caught.message
-          : "Não foi possível enviar sua mensagem.";
+        caught instanceof Error ? caught.message : "Nao foi possivel enviar sua mensagem.";
       setError(message);
+      store.setDraft(content);
       if (assistantId) store.markMessageFailed(assistantId);
       window.dispatchEvent(new Event("hanira:response-error"));
     } finally {
@@ -257,6 +306,10 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
     }
     function voiceSubmit(event: Event) {
       const detail = (event as CustomEvent<{ content: string }>).detail;
+      if (isChatMessageTooLong(detail.content)) {
+        showMessageLengthError();
+        return;
+      }
       store.setDraft(detail.content);
       void submit(detail.content);
     }
@@ -274,9 +327,42 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
   });
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const target = event.currentTarget;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       void submit();
+      return;
+    }
+
+    if (
+      event.key === "Enter" &&
+      event.shiftKey &&
+      willExceedChatMessageLimit(
+        target.value,
+        "\n",
+        target.selectionStart,
+        target.selectionEnd,
+      )
+    ) {
+      event.preventDefault();
+      showMessageLengthError();
+      return;
+    }
+
+    if (
+      event.key.length === 1 &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      !event.altKey &&
+      willExceedChatMessageLimit(
+        target.value,
+        event.key,
+        target.selectionStart,
+        target.selectionEnd,
+      )
+    ) {
+      event.preventDefault();
+      showMessageLengthError();
     }
   }
 
@@ -286,16 +372,29 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
     );
     if (images.length) {
       event.preventDefault();
-      void addImages(images);
+      void addFiles(images);
+      return;
+    }
+
+    const pastedText = event.clipboardData.getData("text");
+    if (
+      pastedText &&
+      willExceedChatMessageLimit(
+        event.currentTarget.value,
+        pastedText,
+        event.currentTarget.selectionStart,
+        event.currentTarget.selectionEnd,
+      )
+    ) {
+      event.preventDefault();
+      showMessageLengthError();
     }
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
-    const images = Array.from(event.dataTransfer.files).filter((file) =>
-      file.type.startsWith("image/"),
-    );
-    if (images.length) void addImages(images);
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length) void addFiles(files);
   }
 
   async function dismissPrivacy(dismiss: boolean) {
@@ -327,7 +426,9 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
         method: "DELETE",
       }).catch(() => undefined);
     }
-    URL.revokeObjectURL(item.previewUrl);
+    if (item.previewUrl) {
+      URL.revokeObjectURL(item.previewUrl);
+    }
     setPendingMedia((value) => value.filter((entry) => entry.id !== item.id));
   }
 
@@ -356,6 +457,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
               onCancel={() => setRecorderOpen(false)}
               onComplete={({ text, attachment, localFile, simulated }) => {
                 const previewUrl = URL.createObjectURL(localFile);
+                const nextDraft = `${store.draft}${store.draft ? " " : ""}${text}`.trim();
                 setPendingMedia((value) => [
                   ...value,
                   {
@@ -366,13 +468,14 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
                     attachment: attachment ?? undefined,
                   },
                 ]);
-                store.setDraft(
-                  `${store.draft}${store.draft ? " " : ""}${text}`.trim(),
-                );
+                if (isChatMessageTooLong(nextDraft)) {
+                  showMessageLengthError();
+                } else {
+                  clearMessageLengthError();
+                  store.setDraft(nextDraft);
+                }
                 if (simulated) {
-                  setError(
-                    "Transcrição simulada no modo demonstração. Revise antes de enviar.",
-                  );
+                  setError("Transcricao simulada no modo demonstracao. Revise antes de enviar.");
                 }
                 setRecorderOpen(false);
               }}
@@ -395,9 +498,16 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
                       unoptimized
                       className="object-cover"
                     />
-                  ) : (
+                  ) : item.type === "audio" ? (
                     <div className="grid h-full place-items-center text-violet-300">
                       <FileAudio className="size-5" />
+                      <span className="absolute bottom-2 max-w-20 truncate text-[9px] text-zinc-500">
+                        {item.file.name}
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="grid h-full place-items-center text-amber-300">
+                      <FileText className="size-5" />
                       <span className="absolute bottom-2 max-w-20 truncate text-[9px] text-zinc-500">
                         {item.file.name}
                       </span>
@@ -419,13 +529,17 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
             ref={ref}
             value={store.draft}
             rows={1}
-            maxLength={8_000}
+            maxLength={CHAT_MESSAGE_MAX_LENGTH}
             aria-label="Mensagem para Hanira"
+            aria-describedby="chat-message-length"
             placeholder={
               pendingMedia.length ? "Pergunte sobre o arquivo..." : "Converse com Hanira..."
             }
             onChange={(event) => {
-              store.setDraft(event.target.value);
+              const nextValue = event.target.value;
+              store.setDraft(nextValue);
+              if (isChatMessageTooLong(nextValue)) showMessageLengthError();
+              else clearMessageLengthError();
               resize();
             }}
             onPaste={handlePaste}
@@ -439,7 +553,18 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
             multiple
             accept="image/png,image/jpeg,image/webp"
             onChange={(event) => {
-              void addImages(Array.from(event.target.files ?? []));
+              void addFiles(Array.from(event.target.files ?? []));
+              event.target.value = "";
+            }}
+          />
+          <input
+            ref={documentInputRef}
+            type="file"
+            hidden
+            multiple
+            accept="application/pdf,text/plain,text/markdown,.txt,.md,.markdown,.pdf"
+            onChange={(event) => {
+              void addFiles(Array.from(event.target.files ?? []));
               event.target.value = "";
             }}
           />
@@ -450,7 +575,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
             accept="image/png,image/jpeg,image/webp"
             capture="environment"
             onChange={(event) => {
-              void addImages(Array.from(event.target.files ?? []));
+              void addFiles(Array.from(event.target.files ?? []));
               event.target.value = "";
             }}
           />
@@ -458,7 +583,17 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
             <div className="flex items-center">
               <button
                 type="button"
-                disabled={!mediaConfig.visionEnabled}
+                disabled={!mediaConfig.attachmentsEnabled}
+                onClick={() => documentInputRef.current?.click()}
+                aria-label="Adicionar documento"
+                title="Adicionar documento"
+                className="rounded-xl p-2.5 text-zinc-500 transition hover:bg-white/[0.05] hover:text-amber-300 disabled:text-zinc-700"
+              >
+                <Paperclip className="size-[18px]" />
+              </button>
+              <button
+                type="button"
+                disabled={!mediaConfig.visionEnabled || !mediaConfig.attachmentsEnabled}
                 onClick={() => imageInputRef.current?.click()}
                 aria-label="Adicionar imagem"
                 title="Adicionar imagem"
@@ -468,7 +603,7 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
               </button>
               <button
                 type="button"
-                disabled={!mediaConfig.visionEnabled}
+                disabled={!mediaConfig.visionEnabled || !mediaConfig.attachmentsEnabled}
                 onClick={() => void requestMediaAccess("camera")}
                 aria-label="Tirar foto"
                 title="Tirar foto"
@@ -485,44 +620,48 @@ export function ChatComposer({ settings }: { settings: UserSettings }) {
                 }
                 onClick={() => void requestMediaAccess("microphone")}
                 aria-label="Gravar voz"
-                title={
-                  settings.voiceEnabled
-                    ? "Gravar voz"
-                    : "Ative a voz nas configurações"
-                }
+                title={settings.voiceEnabled ? "Gravar voz" : "Ative a voz nas configuracoes"}
                 className="rounded-xl p-2.5 text-zinc-500 transition hover:bg-white/[0.05] hover:text-violet-300 disabled:text-zinc-700"
               >
                 <Mic className="size-[18px]" />
               </button>
             </div>
-            {store.isThinking ? (
-              <button
-                type="button"
-                onClick={() => abortRef.current?.abort()}
-                aria-label="Interromper resposta"
-                className="grid size-9 place-items-center rounded-xl bg-white text-black transition hover:bg-rose-100"
+            <div className="flex items-center gap-3">
+              <span
+                id="chat-message-length"
+                className={`text-[10px] ${remainingCharacters <= 200 ? "text-amber-300" : "text-zinc-600"}`}
               >
-                <Square className="size-3.5 fill-current" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                onClick={() => void submit()}
-                disabled={!canSend}
-                aria-label="Enviar mensagem"
-                className="grid size-9 place-items-center rounded-xl bg-white text-black transition hover:bg-violet-100 disabled:bg-white/[0.07] disabled:text-zinc-700"
-              >
-                {uploading ? (
-                  <LoaderCircle className="size-4 animate-spin" />
-                ) : (
-                  <ArrowUp className="size-4" />
-                )}
-              </button>
-            )}
+                {messageLength}/{CHAT_MESSAGE_MAX_LENGTH}
+              </span>
+              {store.isThinking ? (
+                <button
+                  type="button"
+                  onClick={() => abortRef.current?.abort()}
+                  aria-label="Interromper resposta"
+                  className="grid size-9 place-items-center rounded-xl bg-white text-black transition hover:bg-rose-100"
+                >
+                  <Square className="size-3.5 fill-current" />
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => void submit()}
+                  disabled={!canSend}
+                  aria-label="Enviar mensagem"
+                  className="grid size-9 place-items-center rounded-xl bg-white text-black transition hover:bg-violet-100 disabled:bg-white/[0.07] disabled:text-zinc-700"
+                >
+                  {uploading ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <ArrowUp className="size-4" />
+                  )}
+                </button>
+              )}
+            </div>
           </div>
         </div>
         <p className="mt-2.5 text-center text-[10px] text-zinc-700">
-          Hanira pode cometer erros. Considere verificar informações importantes.
+          Hanira pode cometer erros. Considere verificar informacoes importantes.
         </p>
       </div>
       <PrivacyDialog
